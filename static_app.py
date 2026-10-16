@@ -9,6 +9,7 @@ from pathlib import Path
 
 try:
     from skyfield.api import EarthSatellite, load as skyfield_load
+    from skyfield.framelib import ICRS_to_J2000
     try:
         from skyfield.framelib import itrs as skyfield_itrs
     except ImportError:
@@ -1585,7 +1586,7 @@ def summarize_gps_plane_slots(occupancy):
 
 
 # Angular tolerance for matching an Auxiliary/Spare satellite to a vacant
-# baseline slot: half of the fixed 45 deg baseline spacing used by Galileo,
+# baseline slot: a 15 deg band within the fixed 45 deg spacing used by Galileo,
 # BeiDou, and GLONASS. GPS has its own tolerance constants (see
 # GPS_BASELINE_CLASSIFY_TOL / GPS_EXPANSION_CLASSIFY_TOL above) and does not
 # use this constant.
@@ -1673,24 +1674,35 @@ def build_baseline_fill_occupancy(plot_df, expected_positions, tol=BASELINE_FILL
 
 
 def apply_baseline_fill_labels(plot_df, slot_angles, regular_slot_count, constellation_name,
-                                tol=BASELINE_FILL_CLASSIFY_TOL):
+                                tol=BASELINE_FILL_CLASSIFY_TOL, plane_num=None):
     """
-    Add 'Baseline_Fill_Label' and 'Baseline_Fill_Deviation' columns to a
-    per-plane polar-chart frame (see build_baseline_fill_occupancy for the
-    matching rules). No-op for GPS, which has its own richer expansion-slot
-    occupancy model (see build_gps_plane_occupancy).
+    Classify geometric baseline fillers as Regular for display and coverage.
+
+    Slot and Roster_Type preserve the stored assignment; Baseline_Fill_Label
+    and the marker identify the occupied position. This is a geometric role,
+    not an official slot reassignment. GPS keeps its separate occupancy model.
     """
     result = plot_df.copy()
     result['Baseline_Fill_Label'] = None
     result['Baseline_Fill_Deviation'] = np.nan
     if constellation_name == 'GPS' or result.empty:
         return result
+    if 'Roster_Type' not in result:
+        result['Roster_Type'] = result['Type']
+    result['Type'] = result['Roster_Type']
+    result['Marker_Label'] = result['Label'] if 'Label' in result else result['Slot']
     expected_positions = build_baseline_expected_positions(slot_angles, regular_slot_count)
+    if plane_num is not None:
+        prefix = chr(ord('A') + plane_num - 1)
+        expected_positions = {label: angle for label, angle in expected_positions.items()
+                              if label.startswith(prefix)}
     fill_occupancy = build_baseline_fill_occupancy(result, expected_positions, tol=tol)
     for svn, record in fill_occupancy.items():
         mask = result['SVN'] == svn
         result.loc[mask, 'Baseline_Fill_Label'] = record['assigned_label']
         result.loc[mask, 'Baseline_Fill_Deviation'] = record['deviation']
+        result.loc[mask, 'Type'] = 'Regular'
+        result.loc[mask, 'Marker_Label'] = record['assigned_label']
     return result
 
 
@@ -2155,44 +2167,137 @@ def print_argument_of_latitude_debug(constellation_name, plane_num, plot_df, fil
     print("=" * 100 + "\n")
 
 
-def calculate_drift(tle_params, plane, plane_mean_raan=None,
+def unit_vector(vector):
+    """Normalize a finite, nonzero three-vector; reject missing orbital geometry."""
+    vector = np.asarray(vector, dtype=float)
+    length = np.linalg.norm(vector)
+    if vector.shape != (3,) or not np.all(np.isfinite(vector)) or length < 1e-12:
+        raise ValueError("Expected a finite, nonzero orbital three-vector.")
+    return vector / length
+
+
+def orbital_plane_normal(raan_deg, inclination_deg):
+    """Prograde angular-momentum direction in the frame of the supplied angles."""
+    raan, inc = np.radians([raan_deg, inclination_deg])
+    return np.array([np.sin(inc) * np.sin(raan),
+                     -np.sin(inc) * np.cos(raan), np.cos(inc)])
+
+
+def state_plane_normal(params):
+    return unit_vector(np.cross(params['position_eci_km'], params['velocity_eci_km_s']))
+
+
+def calculate_plane_deviation(params, reference_normal):
+    """Signed distance (km) and plane separation (deg), in a common inertial frame."""
+    if reference_normal is None:
+        return np.nan, np.nan
+    normal = unit_vector(reference_normal)
+    satellite_normal = state_plane_normal(params)
+    angle = np.degrees(np.arctan2(np.linalg.norm(np.cross(satellite_normal, normal)),
+                                 np.clip(np.dot(satellite_normal, normal), -1.0, 1.0)))
+    return float(np.dot(params['position_eci_km'], normal)), float(angle)
+
+
+def fit_peer_plane_normals(parsed_data, cluster_assignments, eligible_svns):
+    """Mean unit angular momentum of the same USABLE MEO sample used for clustering."""
+    grouped = {}
+    for svn in eligible_svns:
+        plane = cluster_assignments.get(svn)
+        if plane is not None and plane > 0:
+            grouped.setdefault(plane, []).append(state_plane_normal(parsed_data[svn]))
+    return {plane: unit_vector(np.mean(normals, axis=0))
+            for plane, normals in grouped.items()}
+
+
+def configured_nominal_plane_normals(constellation, raan_map, inclination):
+    """Construct configured design planes in the propagated state's GCRS axes.
+
+    GPS RAANs are epoch-propagated SPS FK5/J2000 values. The other constellations'
+    0/120/240 deg RAANs are schematic app models, explicitly interpreted in GCRS;
+    they are not epoch-defined operator reference orbits.
+    """
+    normals = {plane: orbital_plane_normal(raan, inclination)
+               for plane, raan in raan_map.items()}
+    if constellation == 'GPS':
+        normals = {plane: ICRS_to_J2000.T @ normal for plane, normal in normals.items()}
+    return normals
+
+
+def calculate_fitted_slot_offsets(parsed_data, assignments, roster, slot_angles,
+                                  regular_slot_count, orbital_radius):
+    """Assigned-slot residuals after circular-mean registration of baseline slots.
+
+    These are relative geometry diagnostics, not absolute ephemeris errors. A
+    shared phase rotation is absorbed by the fit. Unknown or wrong-plane labels
+    and planes with fewer than two baseline anchors have no reported offset.
+    """
+    anchors, candidates = {}, {}
+    for svn, params in parsed_data.items():
+        info = roster[svn]
+        plane = assignments.get(svn, info.get('plane', 0))
+        slot = info.get('slot', '')
+        expected = slot_angles.get(slot)
+        if (info.get('status') != 'USABLE' or plane <= 0 or expected is None
+                or not slot.startswith(chr(ord('A') + plane - 1))):
+            continue
+        phase = circular_delta_degrees(params['argument_latitude'], expected)
+        candidates[svn] = (plane, phase)
+        if get_satellite_type(slot, plane, regular_slot_count) == 'Regular':
+            anchors.setdefault(plane, []).append(phase)
+    fitted = {}
+    for plane, phases in anchors.items():
+        if len(phases) < 2:
+            continue
+        mean = np.mean(np.exp(1j * np.radians(phases)))
+        if abs(mean) > 1e-6:
+            fitted[plane] = np.degrees(np.angle(mean))
+    return {
+        svn: (circular_delta_degrees(phase, fitted[plane]),
+              orbital_radius * np.radians(circular_delta_degrees(phase, fitted[plane])))
+        for svn, (plane, phase) in candidates.items() if plane in fitted
+    }
+
+
+def calculate_drift(tle_params,
                     nominal_mean_motion=GAL_NOMINAL_MEAN_MOTION,
                     nominal_inclination=GAL_NOMINAL_INCLINATION,
                     orbital_radius=GAL_ORBITAL_RADIUS,
-                    km_per_degree=GAL_KM_PER_DEGREE,
-                    nominal_raan_map=None):
-    """Calculate in-plane and across-track drift for any GNSS constellation."""
-    if nominal_raan_map is None:
-        nominal_raan_map = GAL_NOMINAL_RAAN
-    
+                    reference_plane_normal=None,
+                    nominal_plane_normal=None, drift_limit_deg_day=2.0,
+                    plane_limit_deg=2.0):
+    """Approximate phase drift rate and exact instantaneous plane geometry.
+
+    Mean motion remains the TLE mean element at its own epoch. Cross-track
+    distance uses the common-epoch propagated position, never R times an
+    angular proxy. All reference normals must share that state's frame.
+    Limits are configurable dashboard screening choices, not service standards.
+    """
     # In-plane drift calculation
     delta_n = tle_params['mean_motion'] - nominal_mean_motion
     drift_angle_per_day = 360.0 * delta_n  # degrees per day
-    in_plane_drift_km_per_day = km_per_degree * drift_angle_per_day
+    in_plane_drift_km_per_day = 2 * np.pi * orbital_radius * delta_n
     
     orbital_period = 24.0 / tle_params['mean_motion']  # hours
     
-    # Across-track drift calculation
-    # Use actual plane mean RAAN if provided, otherwise use nominal
-    reference_raan = plane_mean_raan if plane_mean_raan is not None else nominal_raan_map.get(plane, 0)
-    delta_raan = tle_params['raan'] - reference_raan
-    
-    # Normalize delta_raan to [-180, 180]
-    if delta_raan > 180:
-        delta_raan -= 360
-    elif delta_raan < -180:
-        delta_raan += 360
+    # Peer RAAN remains a diagnostic; acceptance uses the full plane angle.
+    # Do not silently substitute a design plane when no measured peer fit exists.
+    reference_raan = None
+    if reference_plane_normal is not None:
+        normal = unit_vector(reference_plane_normal)
+        reference_raan = np.degrees(np.arctan2(normal[0], -normal[1])) % 360
+    delta_raan = (circular_delta_degrees(tle_params['raan'], reference_raan)
+                  if reference_raan is not None else np.nan)
     
     delta_inclination = tle_params['inclination'] - nominal_inclination
     
-    # Cross-track displacement from RAAN and inclination drift
-    raan_cross_track_km = orbital_radius * np.radians(abs(delta_raan))
-    inc_cross_track_km = orbital_radius * np.radians(abs(delta_inclination))
-    cross_track_km = np.sqrt(raan_cross_track_km**2 + inc_cross_track_km**2)
+    cross_track_km, plane_angle_deg = calculate_plane_deviation(tle_params, reference_plane_normal)
+    nominal_cross_track_km, nominal_plane_angle_deg = calculate_plane_deviation(
+        tle_params, nominal_plane_normal)
     
-    # Check if within tolerance
-    in_plane_tolerance = abs(drift_angle_per_day) < 2.0  # degrees
-    across_track_tolerance = abs(delta_raan) < 2.0 and abs(delta_inclination) < 2.0
+    # Inclusive dashboard screening limits, with units kept separate.
+    in_plane_tolerance = abs(drift_angle_per_day) <= drift_limit_deg_day
+    across_track_tolerance = (plane_angle_deg <= plane_limit_deg
+                             if np.isfinite(plane_angle_deg) else None)
     
     return {
         'delta_mean_motion': delta_n,
@@ -2202,6 +2307,9 @@ def calculate_drift(tle_params, plane, plane_mean_raan=None,
         'delta_raan': delta_raan,
         'delta_inclination': delta_inclination,
         'cross_track_km': cross_track_km,
+        'plane_angle_deg': plane_angle_deg,
+        'nominal_cross_track_km': nominal_cross_track_km,
+        'nominal_plane_angle_deg': nominal_plane_angle_deg,
         'in_plane_ok': in_plane_tolerance,
         'across_track_ok': across_track_tolerance,
         'mean_anomaly': tle_params['mean_anomaly']
@@ -2803,6 +2911,18 @@ def main():
     active_plane_numbers = sorted(active_nominal_raan.keys())
     active_plane_count = len(active_plane_numbers)
     active_plane_spacing = 360 / active_plane_count if active_plane_count else 120
+
+    with st.sidebar.expander("Orbit screening limits"):
+        st.caption("Configurable dashboard limits; defaults are not official service tolerances.")
+        drift_limit_deg_day = st.number_input(
+            "Estimated drift-rate limit (°/day)", min_value=0.0, value=2.0, step=0.1,
+            key=f'drift_limit_{active_name}')
+        plane_limit_deg = st.number_input(
+            "Peer plane-angle limit (°)", min_value=0.0, max_value=180.0,
+            value=2.0, step=0.1, key=f'plane_limit_{active_name}')
+        slot_limit_deg = st.number_input(
+            "Fitted slot-offset limit (°)", min_value=0.0, max_value=180.0,
+            value=2.0, step=0.1, key=f'slot_limit_{active_name}')
     
     # ============================
     # HEADER
@@ -3158,8 +3278,16 @@ def main():
         # Use clustered assignments for further analysis
         plane_mean_raans = {plane_num: cluster_centers[[k for k, v in cluster_to_plane.items() if v == plane_num][0]] 
                            for plane_num in active_plane_numbers}
+
+        peer_plane_normals = fit_peer_plane_normals(
+            parsed_data, cluster_assignments, [entry['svn'] for entry in raan_data])
+        nominal_plane_normals = configured_nominal_plane_normals(
+            active_name, active_nominal_raan, active_nominal_inc)
+        slot_offsets = calculate_fitted_slot_offsets(
+            parsed_data, cluster_assignments, active_sats, active_slot_angles,
+            active_regular_slots, active_orbital_radius)
         
-        # Second pass: Calculate drift relative to plane mean RAAN (using clustered assignments)
+        # Evaluate rate estimates and signed common-epoch plane geometry.
         results = []
         for svn, params in parsed_data.items():
             sat_info = active_sats[svn]
@@ -3169,13 +3297,16 @@ def main():
             epoch_delta_days = (tle_epoch - analysis_epoch).total_seconds() / 86400
             
             drift = calculate_drift(
-                params, plane_num, plane_mean_raans.get(plane_num),
+                params,
                 nominal_mean_motion=active_nominal_mm,
                 nominal_inclination=active_nominal_inc,
                 orbital_radius=active_orbital_radius,
-                km_per_degree=active_km_per_deg,
-                nominal_raan_map=active_nominal_raan
+                reference_plane_normal=peer_plane_normals.get(plane_num),
+                nominal_plane_normal=nominal_plane_normals.get(plane_num),
+                drift_limit_deg_day=drift_limit_deg_day,
+                plane_limit_deg=plane_limit_deg
             )
+            slot_phase_deg, slot_distance_km = slot_offsets.get(svn, (np.nan, np.nan))
             results.append({
                 'SVN': svn,
                 'PRN': sat_info['prn'],
@@ -3188,17 +3319,26 @@ def main():
                 '|Δ Common Epoch| (days)': round(abs(epoch_delta_days), 2),
                 'Mean Motion (rev/day)': params['mean_motion'],
                 'Δn (rev/day)': drift['delta_mean_motion'],
-                'In-Plane Drift (km/day)': drift['in_plane_drift_km_day'],
+                'Estimated Along-Track Rate (km/day)': drift['in_plane_drift_km_day'],
                 'Period (hours)': drift['orbital_period_hours'],
                 'RAAN (°)': params['raan'],
                 'ΔRAAN (°)': drift['delta_raan'],
                 'Inclination (°)': params['inclination'],
                 'ΔInclination (°)': drift['delta_inclination'],
-                'Cross-Track (km)': drift['cross_track_km'],
+                'Peer Cross-Track (km)': drift['cross_track_km'],
+                '|Peer Cross-Track| (km)': abs(drift['cross_track_km']),
+                'Peer Plane Angle (°)': drift['plane_angle_deg'],
+                'Model Cross-Track (km)': drift['nominal_cross_track_km'],
+                'Model Plane Angle (°)': drift['nominal_plane_angle_deg'],
+                'Fitted Slot Offset (°)': slot_phase_deg,
+                'Approx. Along-Track Offset (km)': slot_distance_km,
+                'Slot Offset OK': ('✅' if abs(slot_phase_deg) <= slot_limit_deg else '❌')
+                                  if np.isfinite(slot_phase_deg) else '—',
                 'TLE Mean Anomaly (°)': drift['mean_anomaly'],
                 'Argument of Latitude (°)': params['argument_latitude'],
-                'In-Plane OK': '✅' if drift['in_plane_ok'] else '❌',
-                'Across-Track OK': '✅' if drift['across_track_ok'] else '❌'
+                'Drift Rate OK': '✅' if drift['in_plane_ok'] else '❌',
+                'Peer Plane OK': ('✅' if drift['across_track_ok'] else '❌')
+                                   if drift['across_track_ok'] is not None else '—'
             })
         
         df = pd.DataFrame(results)
@@ -3231,15 +3371,15 @@ def main():
         with col3:
             st.metric("📡 TLEs Analyzed", f"{analyzed_count}/{usable_count}", f"{tle_coverage_pct:.0f}%")
         with col4:
-            in_plane_ok = df['In-Plane OK'].value_counts().get('✅', 0)
+            in_plane_ok = df['Drift Rate OK'].value_counts().get('✅', 0)
             pct = (in_plane_ok/analyzed_count*100) if analyzed_count > 0 else 0
-            st.metric("📈 In-Plane OK", f"{in_plane_ok}/{analyzed_count}", f"{pct:.0f}%")
+            st.metric("📈 Drift Rate OK", f"{in_plane_ok}/{analyzed_count}", f"{pct:.0f}%")
         with col5:
-            across_ok = df['Across-Track OK'].value_counts().get('✅', 0)
+            across_ok = df['Peer Plane OK'].value_counts().get('✅', 0)
             pct = (across_ok/analyzed_count*100) if analyzed_count > 0 else 0
-            st.metric("🌍 Across-Track OK", f"{across_ok}/{analyzed_count}", f"{pct:.0f}%")
+            st.metric("🌍 Peer Plane OK", f"{across_ok}/{analyzed_count}", f"{pct:.0f}%")
         with col6:
-            both_ok = len(df[(df['In-Plane OK'] == '✅') & (df['Across-Track OK'] == '✅')])
+            both_ok = len(df[(df['Drift Rate OK'] == '✅') & (df['Peer Plane OK'] == '✅')])
             pct = (both_ok/analyzed_count*100) if analyzed_count > 0 else 0
             st.metric("✅ Both OK", f"{both_ok}/{analyzed_count}", f"{pct:.0f}%")
         if legacy_metric_column is not None:
@@ -3256,7 +3396,7 @@ def main():
         st.markdown("---")
 
         # Tabs for different views
-        tab_list = ["🛰️ Constellation Map", "📊 Overview", "📈 In-Plane Drift", "🌍 Across-Track Drift", "📡 DOP Calculator"]
+        tab_list = ["🛰️ Constellation Map", "📊 Overview", "📈 Along-Track", "🌍 Cross-Track", "📡 DOP Calculator"]
         
         tabs = st.tabs(tab_list)
         tab_idx = 0
@@ -3534,10 +3674,11 @@ def main():
                         # maneuvered into a baseline slot's geometric position when the
                         # slot's usual occupant goes NOT_USABLE (e.g. GSAT0232/A17
                         # covering Galileo plane 1's vacant A08). Detect this from the
-                        # live TLE geometry so the marker tooltip and caption say which
-                        # slot it's covering, without changing Type/score bucket.
+                        # snapshot geometry. Count and plot a detected filler as a
+                        # baseline occupant, retaining its original roster slot.
                         plot_df = apply_baseline_fill_labels(
-                            plot_df, active_slot_angles, active_regular_slots, active_name
+                            plot_df, active_slot_angles, active_regular_slots, active_name,
+                            plane_num=plane_num
                         )
 
                         print_argument_of_latitude_debug(
@@ -3614,9 +3755,13 @@ def main():
                                                 )
                                         detail_hover.append("<br>".join(parts))
                                 else:
-                                    detail_hover = subset['Baseline_Fill_Label'].apply(
-                                        lambda v: f"Filling baseline slot {v}" if pd.notna(v) else ''
-                                    ).tolist()
+                                    detail_hover = [
+                                        f"{row['SVN']} / {row['PRN']}<br>"
+                                        f"Roster slot: {row['Slot']}<br>"
+                                        + (f"Filling baseline position {row['Baseline_Fill_Label']}"
+                                           if pd.notna(row['Baseline_Fill_Label']) else '')
+                                        for _, row in subset.iterrows()
+                                    ]
 
                                 fig_polar.add_trace(go.Scatterpolar(
                                     r=subset['Marker_Radius'],
@@ -3914,6 +4059,9 @@ def main():
                                     sat_angles.append({
                                         'SVN': row_data['SVN'],
                                         'Slot': row_data['Slot'],
+                                        'Position': (row_data['Baseline_Fill_Label']
+                                                     if pd.notna(row_data['Baseline_Fill_Label'])
+                                                     else row_data['Slot']),
                                         'PRN': row_data['PRN'],
                                         'Angle': theta,
                                         'Type': row_data['Type']
@@ -3942,6 +4090,7 @@ def main():
                                     actual_spacing = (next_sat['Angle'] - sat['Angle']) % 360
                                     spacing_data.append({
                                         'Slot': sat['Slot'],
+                                        'Position': sat['Position'],
                                         'SVN': sat['SVN'],
                                         'PRN': sat['PRN'],
                                         'Expected Spacing (deg)': 'Coverage',
@@ -4092,6 +4241,7 @@ def main():
 
                                     spacing_data.append({
                                         'Slot': sat['Slot'],
+                                        'Position': sat['Position'],
                                         'SVN': sat['SVN'],
                                         'PRN': sat['PRN'],
                                         'Expected Spacing (deg)': f"{expected_spacing:.2f}",
@@ -4151,6 +4301,15 @@ def main():
                             
                             aux_sats = plot_df[plot_df['Type'] == 'Auxiliary']
                             spare_sats = plot_df[plot_df['Type'] == 'Spare']
+                            baseline_fillers = plot_df[plot_df['Baseline_Fill_Label'].notna()]
+                            if not baseline_fillers.empty:
+                                fill_labels = [
+                                    f"{row['SVN']} / {row['PRN']}: {row['Baseline_Fill_Label']} "
+                                    f"(roster {row['Slot']})"
+                                    for _, row in baseline_fillers.iterrows()
+                                ]
+                                st.caption("**Baseline positions filled geometrically:** " + ", ".join(fill_labels)
+                                           + ". Counted toward baseline coverage; original roster labels are retained.")
                             if len(aux_sats) > 0:
                                 if active_name == 'GPS' and 'GPS_Assigned_Label' in aux_sats.columns:
                                     labels = [
@@ -4646,7 +4805,7 @@ def main():
         with tabs[tab_idx]:  # Overview (now second)
             tab_idx += 1
             st.markdown(f"## 📊 {active_name} Constellation Status Overview")
-            st.caption("Detailed drift analysis and operational status by orbital plane")
+            st.caption("Estimated drift rates and instantaneous orbital geometry by plane; OK flags use dashboard screening limits.")
             
             for plane_num in active_plane_numbers:
                 plane_df = df[df['Plane'] == f"Plane {plane_num}"]
@@ -4676,11 +4835,11 @@ def main():
                 with col2:
                     st.metric("🌍 Mean RAAN", f"{mean_raan:.1f}°")
                 with col3:
-                    in_plane_ok = len(plane_df[plane_df['In-Plane OK'] == '✅'])
-                    st.metric("✅ In-Plane OK", f"{in_plane_ok}/{len(plane_df)}")
+                    in_plane_ok = len(plane_df[plane_df['Drift Rate OK'] == '✅'])
+                    st.metric("✅ Drift Rate OK", f"{in_plane_ok}/{len(plane_df)}")
                 with col4:
-                    across_ok = len(plane_df[plane_df['Across-Track OK'] == '✅'])
-                    st.metric("✅ Across-Track OK", f"{across_ok}/{len(plane_df)}")
+                    across_ok = len(plane_df[plane_df['Peer Plane OK'] == '✅'])
+                    st.metric("✅ Peer Plane OK", f"{across_ok}/{len(plane_df)}")
                 
                 st.markdown("")
                 
@@ -4691,7 +4850,8 @@ def main():
                         plane_df[[
                             'SVN', 'PRN', 'Slot', 'Type',
                             'TLE Epoch (UTC)', 'Δ Common Epoch (days)', '|Δ Common Epoch| (days)',
-                            'Argument of Latitude (°)', 'In-Plane Drift (km/day)', 'In-Plane OK'
+                            'Argument of Latitude (°)', 'Estimated Along-Track Rate (km/day)', 'Drift Rate OK',
+                            'Fitted Slot Offset (°)', 'Approx. Along-Track Offset (km)', 'Slot Offset OK'
                         ]],
                         hide_index=True,
                         use_container_width=True
@@ -4702,99 +4862,158 @@ def main():
                         plane_df[[
                             'SVN', 'PRN', 'Slot', 'Type',
                             'TLE Epoch (UTC)', 'Δ Common Epoch (days)', '|Δ Common Epoch| (days)',
-                            'Cross-Track (km)', 'Across-Track OK'
+                            'Peer Cross-Track (km)', 'Peer Plane Angle (°)', 'Peer Plane OK',
+                            'Model Cross-Track (km)', 'Model Plane Angle (°)'
                         ]],
                         hide_index=True,
                         use_container_width=True
                     )
         
-        with tabs[tab_idx]:  # In-Plane Drift
+        with tabs[tab_idx]:  # Along-track rate and position diagnostics
             tab_idx += 1
-            st.markdown(f"## 📈 {active_name} In-Plane Drift Analysis")
-            st.caption("Along-track position deviation monitoring (±2° tolerance)")
+            st.markdown(f"## 📈 {active_name} Along-Track Analysis")
+            st.caption("Estimated rate from TLE mean motion relative to the configured nominal mean motion. "
+                       "This circular-orbit approximation is not an accumulated slot-position error or a measured historical trend.")
+            st.caption(f"Configured nominal mean motion: {active_nominal_mm:.8f} rev/day; "
+                       f"screening limit: ±{drift_limit_deg_day:g}°/day. "
+                       "Mean motion is retained at each TLE epoch; positions and plane geometry use the common SGP4 epoch.")
             
             operational_df = df[df['Plane'] != "Non-nominal"]
             
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                in_tolerance = len(operational_df[operational_df['In-Plane OK'] == '✅'])
-                st.metric("✅ Within Tolerance", f"{in_tolerance}/{len(operational_df)}")
+                in_tolerance = len(operational_df[operational_df['Drift Rate OK'] == '✅'])
+                st.metric("✅ Rate Within Limit", f"{in_tolerance}/{len(operational_df)}")
             with col2:
-                avg_drift = operational_df['In-Plane Drift (km/day)'].mean()
-                st.metric("📊 Avg Drift", f"{avg_drift:.2f} km/day")
+                avg_drift = operational_df['Estimated Along-Track Rate (km/day)'].mean()
+                st.metric("📊 Mean Signed Rate", f"{avg_drift:.2f} km/day")
             with col3:
-                max_drift = operational_df['In-Plane Drift (km/day)'].abs().max()
-                st.metric("⚠️ Max Drift", f"{max_drift:.2f} km/day")
+                max_drift = operational_df['Estimated Along-Track Rate (km/day)'].abs().max()
+                st.metric("⚠️ Max Absolute Rate", f"{max_drift:.2f} km/day")
             with col4:
-                tolerance = 2 * active_km_per_deg
-                st.metric("🎯 Tolerance", f"±{tolerance:.1f} km/day")
+                tolerance = drift_limit_deg_day * active_km_per_deg
+                st.metric("🎯 Rate Limit", f"±{tolerance:.1f} km/day")
             
             st.markdown("---")
             
-            st.markdown("### 📍 Drift by Satellite")
-            fig = px.scatter(operational_df, x='SVN', y='In-Plane Drift (km/day)', 
-                           color='Plane', size='Cross-Track (km)',
+            st.markdown("### 📍 Estimated Drift Rate by Satellite")
+            fig = px.scatter(operational_df, x='SVN', y='Estimated Along-Track Rate (km/day)',
+                           color='Plane', size='|Peer Cross-Track| (km)',
                            hover_data=['PRN', 'Slot', 'Status', 'Mean Motion (rev/day)', 'Argument of Latitude (°)'],
-                           title=f"{active_name} In-Plane Drift by Satellite")
-            fig.add_hline(y=2*active_km_per_deg, line_dash="dash", line_color="red", 
-                         annotation_text="Upper Tolerance (+2°)")
-            fig.add_hline(y=-2*active_km_per_deg, line_dash="dash", line_color="red",
-                         annotation_text="Lower Tolerance (-2°)")
+                           title=f"{active_name} Estimated Along-Track Drift Rate")
+            fig.add_hline(y=tolerance, line_dash="dash", line_color="red",
+                         annotation_text=f"Upper limit (+{drift_limit_deg_day:g}°/day)")
+            fig.add_hline(y=-tolerance, line_dash="dash", line_color="red",
+                         annotation_text=f"Lower limit (-{drift_limit_deg_day:g}°/day)")
             fig.update_layout(height=500)
             st.plotly_chart(fig, use_container_width=True)
             
             st.markdown("")
             
             st.markdown("### 📊 Distribution Analysis")
-            fig2 = px.histogram(operational_df, x='In-Plane Drift (km/day)', nbins=30,
-                              title=f"Distribution of {active_name} In-Plane Drift",
-                              labels={'In-Plane Drift (km/day)': 'Drift (km/day)'})
+            fig2 = px.histogram(operational_df, x='Estimated Along-Track Rate (km/day)', nbins=30,
+                              title=f"Distribution of {active_name} Estimated Drift Rates",
+                              labels={'Estimated Along-Track Rate (km/day)': 'Estimated rate (km/day)'})
             fig2.update_layout(height=400)
             st.plotly_chart(fig2, use_container_width=True)
+
+            st.markdown("### 📍 Fitted Assigned-Slot Offsets")
+            st.caption("Offsets are relative to a phase fitted from usable baseline slot labels in each plane. "
+                       "A shared phase shift is removed, so these are relative constellation-geometry diagnostics. "
+                       "Distance ≈ nominal radius × phase offset in radians, assuming a nearly circular orbit. "
+                       "Unknown slots, labels from another plane, or insufficient baseline anchors are unavailable.")
+            slot_df = operational_df.dropna(subset=['Fitted Slot Offset (°)'])
+            if slot_df.empty:
+                st.info("No assigned slots have sufficient reference geometry for an offset estimate.")
+            else:
+                slot_ok = (slot_df['Fitted Slot Offset (°)'].abs() <= slot_limit_deg).sum()
+                st.metric("Assigned Slots Within Limit", f"{slot_ok}/{len(slot_df)}",
+                          help=f"Configured relative phase-offset limit: ±{slot_limit_deg:g}°.")
+                slot_fig = px.scatter(slot_df, x='SVN', y='Fitted Slot Offset (°)', color='Plane',
+                                      hover_data=['PRN', 'Slot', 'Approx. Along-Track Offset (km)'],
+                                      title=f"{active_name} Fitted Assigned-Slot Phase Offsets")
+                slot_fig.add_hline(y=slot_limit_deg, line_dash="dash", line_color="red")
+                slot_fig.add_hline(y=-slot_limit_deg, line_dash="dash", line_color="red")
+                st.plotly_chart(slot_fig, use_container_width=True)
+            st.dataframe(operational_df[['SVN', 'PRN', 'Plane', 'Slot', 'Fitted Slot Offset (°)',
+                                        'Approx. Along-Track Offset (km)', 'Slot Offset OK']],
+                         hide_index=True, use_container_width=True)
+            with st.expander("Along-track method and units"):
+                st.latex(r"\Delta n=n_{\mathrm{TLE}}-n_0\quad[\mathrm{rev/day}],\qquad "
+                         r"\dot{\phi}=360\Delta n\quad[\mathrm{deg/day}]")
+                st.latex(r"\dot{s}_{\mathrm{estimate}}=2\pi R_0\Delta n\quad[\mathrm{km/day}],\qquad "
+                         r"\Delta s_{\mathrm{slot}}\approx R_0\Delta u\quad[\mathrm{km}]")
+                st.caption("Positive rate means gaining phase; negative means falling behind. "
+                           "Slot phase Δu is wrapped to [-180°, 180°) and converted to radians for distance. "
+                           "This snapshot contains one TLE per satellite; propagation would give a prediction, not an observed drift history.")
         
-        with tabs[tab_idx]:  # Across-Track Drift
+        with tabs[tab_idx]:  # Instantaneous cross-track geometry
             tab_idx += 1
-            st.markdown(f"## 🌍 {active_name} Across-Track Drift Analysis")
-            st.caption("Orbital plane deviation monitoring (±2° RAAN tolerance)")
+            st.markdown(f"## 🌍 {active_name} Cross-Track Geometry")
+            st.caption("Signed perpendicular distance to the measured peer plane at the common SGP4 epoch. "
+                       "Positive is along its prograde angular-momentum normal. Distance is in km; plane separation is in degrees. "
+                       "These are instantaneous geometry values, not cross-track drift rates.")
+            st.caption("Each peer plane is the normalized mean of unit orbital-angular-momentum vectors "
+                       "of its usable MEO clustering members. A common tilt of the entire plane is absorbed by this fit.")
             
             operational_df = df[df['Plane'] != "Non-nominal"]
             
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                across_ok = len(operational_df[operational_df['Across-Track OK'] == '✅'])
-                st.metric("✅ Within Tolerance", f"{across_ok}/{len(operational_df)}")
+                across_ok = len(operational_df[operational_df['Peer Plane OK'] == '✅'])
+                st.metric("✅ Peer Plane Within Limit", f"{across_ok}/{len(operational_df)}")
             with col2:
-                avg_raan_dev = operational_df['ΔRAAN (°)'].abs().mean()
-                st.metric("📊 Avg RAAN Dev", f"{avg_raan_dev:.2f}°")
+                avg_plane_angle = operational_df['Peer Plane Angle (°)'].mean()
+                st.metric("📊 Mean Plane Angle", f"{avg_plane_angle:.2f}°")
             with col3:
-                avg_cross_track = operational_df['Cross-Track (km)'].abs().mean()
-                st.metric("📏 Avg Cross-Track", f"{avg_cross_track:.1f} km")
+                avg_cross_track = operational_df['Peer Cross-Track (km)'].abs().mean()
+                st.metric("📏 Mean Absolute Cross-Track", f"{avg_cross_track:.1f} km")
             with col4:
-                st.metric("🎯 Tolerance", "±2°")
+                st.metric("🎯 Peer Plane-Angle Limit", f"{plane_limit_deg:g}°")
             
             st.markdown("---")
             
-            st.markdown("### 📍 RAAN Deviation by Satellite")
-            fig = px.scatter(operational_df, x='SVN', y='ΔRAAN (°)', 
-                           color='Plane', size='Cross-Track (km)',
-                           hover_data=['PRN', 'Slot', 'Status', 'RAAN (°)'],
-                           title=f"{active_name} RAAN Deviation by Satellite")
-            fig.add_hline(y=2, line_dash="dash", line_color="red", 
-                         annotation_text="Upper Tolerance (+2°)")
-            fig.add_hline(y=-2, line_dash="dash", line_color="red",
-                         annotation_text="Lower Tolerance (-2°)")
+            st.markdown("### 📍 Orbital Plane Separation")
+            fig = px.scatter(operational_df, x='SVN', y='Peer Plane Angle (°)',
+                           color='Plane', size='|Peer Cross-Track| (km)',
+                           hover_data=['PRN', 'Slot', 'Status', 'ΔRAAN (°)', 'ΔInclination (°)'],
+                           title=f"{active_name} Angle to Measured Peer Plane")
+            fig.add_hline(y=plane_limit_deg, line_dash="dash", line_color="red",
+                         annotation_text=f"Configured limit ({plane_limit_deg:g}°)")
             fig.update_layout(height=500)
             st.plotly_chart(fig, use_container_width=True)
             
             st.markdown("")
             
             st.markdown("### 📏 Cross-Track Displacement")
-            fig2 = px.bar(operational_df, x='SVN', y='Cross-Track (km)', 
+            fig2 = px.bar(operational_df, x='SVN', y='Peer Cross-Track (km)',
                          color='Plane',
                          hover_data=['PRN', 'Slot', 'Status'],
-                         title=f"{active_name} Cross-Track Displacement (km)")
+                         title=f"{active_name} Signed Cross-Track Distance to Peer Plane (km)")
+            fig2.add_hline(y=0, line_color="gray")
             fig2.update_layout(height=400)
             st.plotly_chart(fig2, use_container_width=True)
+
+            st.markdown("### Peer Plane and Configured Nominal Model")
+            if active_name == 'GPS':
+                st.caption("The nominal model uses the app's SPS reference RAANs propagated by its configured nodal regression "
+                           "to the analysis epoch, and its nominal inclination. FK5/J2000 axes are rotated into GCRS. "
+                           "Model differences are diagnostic and are not an official service-compliance test.")
+            else:
+                st.caption("The nominal model uses the app's schematic 0°/120°/240° RAANs interpreted in GCRS and configured inclination. "
+                           "It is not an epoch-defined operator reference; its differences cannot establish station-keeping compliance.")
+            st.dataframe(operational_df[['SVN', 'PRN', 'Plane', 'Peer Cross-Track (km)', 'Peer Plane Angle (°)',
+                                        'Peer Plane OK', 'Model Cross-Track (km)', 'Model Plane Angle (°)']],
+                         hide_index=True, use_container_width=True)
+            with st.expander("Cross-track method and units"):
+                st.latex(r"\hat{\mathbf h}=\frac{\mathbf r\times\mathbf v}{\|\mathbf r\times\mathbf v\|},\qquad "
+                         r"d_{\perp}=\mathbf r\cdot\hat{\mathbf n}_0\quad[\mathrm{km}]")
+                st.latex(r"\alpha=\operatorname{atan2}(\|\hat{\mathbf h}\times\hat{\mathbf n}_0\|,"
+                         r"\hat{\mathbf h}\cdot\hat{\mathbf n}_0)\quad[\mathrm{rad}]")
+                st.caption("Angles are displayed in degrees. Position, velocity and reference normal use the same GCRS axes. "
+                           "The plane-angle check remains meaningful at a plane crossing where distance is zero. "
+                           "RAAN and inclination offsets are supplementary diagnostics; acceptance uses the full peer plane angle. "
+                           "All limits are configurable dashboard choices, not official constellation tolerances.")
         
         with tabs[tab_idx]:  # DOP Calculator
             tab_idx += 1
