@@ -99,27 +99,6 @@ def test_mean_motion_rate_units_sign_and_configurable_limit(delta_n):
     assert result['in_plane_ok'] == (abs(delta_n) < 0.0005)
 
 
-def test_slot_offsets_are_relative_wrap_correctly_and_skip_invalid_references():
-    slots = {'a': 'A01', 'b': 'A02', 'unknown': 'Unk', 'wrong': 'B01'}
-    roster = {svn: {'slot': slot, 'plane': 1, 'status': 'USABLE'} for svn, slot in slots.items()}
-    angles = {'A01': 0, 'A02': 45, 'B01': 0}
-    states = {svn: circular_state(phase=phase)
-              for svn, phase in zip(slots, [359, 46, 75, 20])}
-    assignments = {svn: 1 for svn in slots}
-    offsets = app.calculate_fitted_slot_offsets(states, assignments, roster, angles, 8, 30000)
-    assert set(offsets) == {'a', 'b'}
-    assert offsets['a'] == pytest.approx((-1, -30000 * np.pi / 180))
-    assert offsets['b'] == pytest.approx((1, 30000 * np.pi / 180))
-    # A shared phase rotation must not become a claimed absolute slot error.
-    for state in states.values():
-        state['argument_latitude'] = (state['argument_latitude'] + 50) % 360
-    shifted = app.calculate_fitted_slot_offsets(states, assignments, roster, angles, 8, 30000)
-    assert shifted['a'] == pytest.approx(offsets['a'])
-    assert shifted['b'] == pytest.approx(offsets['b'])
-    roster['b']['status'] = 'NOT_USABLE'
-    assert app.calculate_fitted_slot_offsets(states, assignments, roster, angles, 8, 30000) == {}
-
-
 def test_configured_gps_design_normal_is_in_the_propagated_state_frame():
     normal = app.configured_nominal_plane_normals('GPS', {1: 288.85}, 55)[1]
     # Convert back to the specification axes and recover its prescribed normal.

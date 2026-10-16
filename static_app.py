@@ -2223,41 +2223,6 @@ def configured_nominal_plane_normals(constellation, raan_map, inclination):
     return normals
 
 
-def calculate_fitted_slot_offsets(parsed_data, assignments, roster, slot_angles,
-                                  regular_slot_count, orbital_radius):
-    """Assigned-slot residuals after circular-mean registration of baseline slots.
-
-    These are relative geometry diagnostics, not absolute ephemeris errors. A
-    shared phase rotation is absorbed by the fit. Unknown or wrong-plane labels
-    and planes with fewer than two baseline anchors have no reported offset.
-    """
-    anchors, candidates = {}, {}
-    for svn, params in parsed_data.items():
-        info = roster[svn]
-        plane = assignments.get(svn, info.get('plane', 0))
-        slot = info.get('slot', '')
-        expected = slot_angles.get(slot)
-        if (info.get('status') != 'USABLE' or plane <= 0 or expected is None
-                or not slot.startswith(chr(ord('A') + plane - 1))):
-            continue
-        phase = circular_delta_degrees(params['argument_latitude'], expected)
-        candidates[svn] = (plane, phase)
-        if get_satellite_type(slot, plane, regular_slot_count) == 'Regular':
-            anchors.setdefault(plane, []).append(phase)
-    fitted = {}
-    for plane, phases in anchors.items():
-        if len(phases) < 2:
-            continue
-        mean = np.mean(np.exp(1j * np.radians(phases)))
-        if abs(mean) > 1e-6:
-            fitted[plane] = np.degrees(np.angle(mean))
-    return {
-        svn: (circular_delta_degrees(phase, fitted[plane]),
-              orbital_radius * np.radians(circular_delta_degrees(phase, fitted[plane])))
-        for svn, (plane, phase) in candidates.items() if plane in fitted
-    }
-
-
 def calculate_drift(tle_params,
                     nominal_mean_motion=GAL_NOMINAL_MEAN_MOTION,
                     nominal_inclination=GAL_NOMINAL_INCLINATION,
@@ -2920,9 +2885,6 @@ def main():
         plane_limit_deg = st.number_input(
             "Peer plane-angle limit (°)", min_value=0.0, max_value=180.0,
             value=2.0, step=0.1, key=f'plane_limit_{active_name}')
-        slot_limit_deg = st.number_input(
-            "Fitted slot-offset limit (°)", min_value=0.0, max_value=180.0,
-            value=2.0, step=0.1, key=f'slot_limit_{active_name}')
     
     # ============================
     # HEADER
@@ -3283,9 +3245,6 @@ def main():
             parsed_data, cluster_assignments, [entry['svn'] for entry in raan_data])
         nominal_plane_normals = configured_nominal_plane_normals(
             active_name, active_nominal_raan, active_nominal_inc)
-        slot_offsets = calculate_fitted_slot_offsets(
-            parsed_data, cluster_assignments, active_sats, active_slot_angles,
-            active_regular_slots, active_orbital_radius)
         
         # Evaluate rate estimates and signed common-epoch plane geometry.
         results = []
@@ -3306,7 +3265,6 @@ def main():
                 drift_limit_deg_day=drift_limit_deg_day,
                 plane_limit_deg=plane_limit_deg
             )
-            slot_phase_deg, slot_distance_km = slot_offsets.get(svn, (np.nan, np.nan))
             results.append({
                 'SVN': svn,
                 'PRN': sat_info['prn'],
@@ -3330,10 +3288,6 @@ def main():
                 'Peer Plane Angle (°)': drift['plane_angle_deg'],
                 'Model Cross-Track (km)': drift['nominal_cross_track_km'],
                 'Model Plane Angle (°)': drift['nominal_plane_angle_deg'],
-                'Fitted Slot Offset (°)': slot_phase_deg,
-                'Approx. Along-Track Offset (km)': slot_distance_km,
-                'Slot Offset OK': ('✅' if abs(slot_phase_deg) <= slot_limit_deg else '❌')
-                                  if np.isfinite(slot_phase_deg) else '—',
                 'TLE Mean Anomaly (°)': drift['mean_anomaly'],
                 'Argument of Latitude (°)': params['argument_latitude'],
                 'Drift Rate OK': '✅' if drift['in_plane_ok'] else '❌',
@@ -4850,8 +4804,7 @@ def main():
                         plane_df[[
                             'SVN', 'PRN', 'Slot', 'Type',
                             'TLE Epoch (UTC)', 'Δ Common Epoch (days)', '|Δ Common Epoch| (days)',
-                            'Argument of Latitude (°)', 'Estimated Along-Track Rate (km/day)', 'Drift Rate OK',
-                            'Fitted Slot Offset (°)', 'Approx. Along-Track Offset (km)', 'Slot Offset OK'
+                            'Argument of Latitude (°)', 'Estimated Along-Track Rate (km/day)', 'Drift Rate OK'
                         ]],
                         hide_index=True,
                         use_container_width=True
@@ -4917,34 +4870,11 @@ def main():
             fig2.update_layout(height=400)
             st.plotly_chart(fig2, use_container_width=True)
 
-            st.markdown("### 📍 Fitted Assigned-Slot Offsets")
-            st.caption("Offsets are relative to a phase fitted from usable baseline slot labels in each plane. "
-                       "A shared phase shift is removed, so these are relative constellation-geometry diagnostics. "
-                       "Distance ≈ nominal radius × phase offset in radians, assuming a nearly circular orbit. "
-                       "Unknown slots, labels from another plane, or insufficient baseline anchors are unavailable.")
-            slot_df = operational_df.dropna(subset=['Fitted Slot Offset (°)'])
-            if slot_df.empty:
-                st.info("No assigned slots have sufficient reference geometry for an offset estimate.")
-            else:
-                slot_ok = (slot_df['Fitted Slot Offset (°)'].abs() <= slot_limit_deg).sum()
-                st.metric("Assigned Slots Within Limit", f"{slot_ok}/{len(slot_df)}",
-                          help=f"Configured relative phase-offset limit: ±{slot_limit_deg:g}°.")
-                slot_fig = px.scatter(slot_df, x='SVN', y='Fitted Slot Offset (°)', color='Plane',
-                                      hover_data=['PRN', 'Slot', 'Approx. Along-Track Offset (km)'],
-                                      title=f"{active_name} Fitted Assigned-Slot Phase Offsets")
-                slot_fig.add_hline(y=slot_limit_deg, line_dash="dash", line_color="red")
-                slot_fig.add_hline(y=-slot_limit_deg, line_dash="dash", line_color="red")
-                st.plotly_chart(slot_fig, use_container_width=True)
-            st.dataframe(operational_df[['SVN', 'PRN', 'Plane', 'Slot', 'Fitted Slot Offset (°)',
-                                        'Approx. Along-Track Offset (km)', 'Slot Offset OK']],
-                         hide_index=True, use_container_width=True)
             with st.expander("Along-track method and units"):
                 st.latex(r"\Delta n=n_{\mathrm{TLE}}-n_0\quad[\mathrm{rev/day}],\qquad "
                          r"\dot{\phi}=360\Delta n\quad[\mathrm{deg/day}]")
-                st.latex(r"\dot{s}_{\mathrm{estimate}}=2\pi R_0\Delta n\quad[\mathrm{km/day}],\qquad "
-                         r"\Delta s_{\mathrm{slot}}\approx R_0\Delta u\quad[\mathrm{km}]")
+                st.latex(r"\dot{s}_{\mathrm{estimate}}=2\pi R_0\Delta n\quad[\mathrm{km/day}]")
                 st.caption("Positive rate means gaining phase; negative means falling behind. "
-                           "Slot phase Δu is wrapped to [-180°, 180°) and converted to radians for distance. "
                            "This snapshot contains one TLE per satellite; propagation would give a prediction, not an observed drift history.")
         
         with tabs[tab_idx]:  # Instantaneous cross-track geometry

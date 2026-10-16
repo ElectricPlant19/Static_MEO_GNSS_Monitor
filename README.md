@@ -64,18 +64,12 @@ controls.
 
 ## Along-track and cross-track diagnostics
 
-The **Along-Track** tab separates a rate estimate from a slot-position offset:
+The **Along-Track** tab shows the estimated orbital-phase drift rate:
 
 - **Estimated along-track rate (km/day)** is `2π R₀ (n_TLE − n₀)`, using the
   configured nominal radius in km and mean motions in rev/day. Positive means
   gaining orbital phase. This is a circular-orbit approximation; TLE mean motion
   stays at its own element epoch and is not an observed drift history.
-- **Fitted slot offset (degrees)** is the signed, wrapped argument-of-latitude
-  residual against the assigned slot, after circular-mean phase registration of
-  the usable baseline slots in that plane. The approximate distance is `R₀ Δu`
-  in km with `Δu` in radians. At least two valid baseline anchors are required;
-  unknown and wrong-plane labels are unavailable. This relative fit absorbs a
-  common phase shift, so it cannot establish absolute slot maintenance.
 
 The **Cross-Track** tab uses common-epoch SGP4 position and velocity in GCRS:
 
@@ -94,8 +88,8 @@ The **Cross-Track** tab uses common-epoch SGP4 position and velocity in GCRS:
   diagnostic, not service-compliance determinations. The peer fit absorbs a
   tilt shared by its entire plane.
 
-The sidebar exposes independent **drift-rate (°/day)**, **peer plane-angle (°)**
-and **fitted slot-offset (°)** limits. The defaults of 2 in each quantity are
+The sidebar exposes independent **drift-rate (°/day)** and **peer plane-angle (°)**
+limits. The defaults of 2 in each quantity are
 dashboard screening choices, not official constellation tolerances. Flags and
 chart lines use these configured limits, including the boundary. Existing
 constellation-health/slot-occupancy scoring remains separate.

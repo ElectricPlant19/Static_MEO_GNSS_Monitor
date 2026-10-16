@@ -100,7 +100,10 @@ def test_every_constellation_and_combined_dop_without_parent_files_or_network(tm
             assert np.all(np.isfinite(geometry['Peer Cross-Track (km)']))
             assert np.all(geometry['Peer Plane Angle (°)'] >= 0)
             assert np.all(geometry['Peer Plane Angle (°)'] <= 180)
-            assert any('Fitted Slot Offset (°)' in item.value.columns for item in dashboard.dataframe)
+            assert not any('Fitted Slot Offset (°)' in item.value.columns for item in dashboard.dataframe)
+            assert not any(item.label == 'Assigned Slots Within Limit' for item in dashboard.metric)
+            assert not any('Fitted Assigned-Slot' in item.value for item in dashboard.markdown)
+            assert not any('slot-offset limit' in item.label for item in dashboard.number_input)
             if name == 'Galileo':
                 assert next(item.value for item in dashboard.metric if item.label == '🛰️ Satellites') == '8'
                 assert next(item.value for item in dashboard.metric if item.label == 'Satellites') == '8'
@@ -143,8 +146,7 @@ def test_every_constellation_and_combined_dop_without_parent_files_or_network(tm
 
         # Changing dashboard limits updates both physical flags and chart labels.
         dashboard.number_input(key="drift_limit_GLONASS").set_value(0.0)
-        dashboard.number_input(key="plane_limit_GLONASS").set_value(180.0)
-        dashboard.number_input(key="slot_limit_GLONASS").set_value(0.0).run()
+        dashboard.number_input(key="plane_limit_GLONASS").set_value(180.0).run()
         assert not dashboard.exception
         geometry = next(item.value for item in dashboard.dataframe
                         if 'Model Plane Angle (°)' in item.value.columns)
